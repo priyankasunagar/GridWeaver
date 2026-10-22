@@ -1,7 +1,12 @@
-import { GridTopology, RestorationPlan, SimulationMetrics } from '../models/grid';
+
+import {
+  GridTopology,
+  RestorationPlan,
+  SimulationMetrics,
+} from '../models/grid';
 
 export interface HealthCheckResponse {
-  status: 'healthy' | 'degraded';
+  status: 'healthy' | 'degraded' | 'ok';
   version: string;
   solverEngines: {
     qiskitAerAvailable: boolean;
@@ -143,19 +148,29 @@ export interface CompareScenariosResponse {
   }>;
 }
 
-type StatusListener = (online: boolean, health: HealthCheckResponse | null) => void;
+type StatusListener = (
+  online: boolean,
+  health: HealthCheckResponse | null
+) => void;
+
+const BACKEND_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  'https://grid-weaver-25cf.vercel.app'
+).replace(/\/+$/, '');
 
 class GridWeaverApiClient {
   private baseUrl: string;
-  private isConnected: boolean = false;
+  private isConnected = false;
   private healthData: HealthCheckResponse | null = null;
   private listeners: Set<StatusListener> = new Set();
 
-  constructor(baseUrl: string = 'http://localhost:8000') {
-    this.baseUrl = baseUrl;
-    // Auto-check health in background
+  constructor(baseUrl: string = BACKEND_URL) {
+    this.baseUrl = baseUrl.replace(/\/+$/, '');
+
     if (typeof window !== 'undefined') {
-      setTimeout(() => this.checkHealth(), 500);
+      window.setTimeout(() => {
+        void this.checkHealth();
+      }, 500);
     }
   }
 
@@ -163,54 +178,55 @@ class GridWeaverApiClient {
     return this.baseUrl;
   }
 
-  public setBaseUrl(url: string) {
-    this.baseUrl = url;
-    this.checkHealth();
+  public setBaseUrl(url: string): void {
+    this.baseUrl = url.replace(/\/+$/, '');
+    void this.checkHealth();
   }
 
   public subscribeStatus(listener: StatusListener): () => void {
     this.listeners.add(listener);
     listener(this.isConnected, this.healthData);
+
     return () => {
       this.listeners.delete(listener);
     };
   }
 
-  private notify() {
-    this.listeners.forEach((fn) => fn(this.isConnected, this.healthData));
+  private notify(): void {
+    this.listeners.forEach((listener) => {
+      listener(this.isConnected, this.healthData);
+    });
   }
 
   public async checkHealth(): Promise<HealthCheckResponse | null> {
-    const urlsToTry = [this.baseUrl, 'http://localhost:8000', 'http://localhost:8001', 'http://127.0.0.1:8000', 'http://127.0.0.1:8001'];
-    // Deduplicate
-    const uniqueUrls = Array.from(new Set(urlsToTry));
+    try {
+      const response = await fetch(`${this.baseUrl}/health`, {
+        method: 'GET',
+        credentials: 'omit',
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
 
-    for (const url of uniqueUrls) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1200);
-        const res = await fetch(`${url}/health`, {
-          credentials: 'omit',
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (res.ok) {
-          const data = await res.json();
-          this.baseUrl = url;
-          this.isConnected = true;
-          this.healthData = data;
-          this.notify();
-          return this.healthData;
-        }
-      } catch {
-        // Continue trying next candidate
+      if (!response.ok) {
+        throw new Error(`Health check failed: HTTP ${response.status}`);
       }
-    }
 
-    this.isConnected = false;
-    this.healthData = null;
-    this.notify();
-    return null;
+      const data = (await response.json()) as HealthCheckResponse;
+
+      this.isConnected = true;
+      this.healthData = data;
+      this.notify();
+
+      return data;
+    } catch (error) {
+      console.error('GridWeaver backend health check failed:', error);
+
+      this.isConnected = false;
+      this.healthData = null;
+      this.notify();
+
+      return null;
+    }
   }
 
   public isBackendOnline(): boolean {
@@ -223,98 +239,133 @@ class GridWeaverApiClient {
 
   public async getGridTopology(): Promise<GridTopology | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/grid`);
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+      const response = await fetch(`${this.baseUrl}/api/grid`);
+
+      if (!response.ok) {
+        throw new Error(`Grid request failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      this.isConnected = true;
+      const data = (await response.json()) as GridTopology;
+      this.notify();
+
+      return data;
+    } catch (error) {
+      console.error('Grid topology request failed:', error);
       return null;
     }
   }
 
-  public async simulateScenario(req: SimulateScenarioRequest): Promise<SimulateScenarioResponse | null> {
+  public async simulateScenario(
+    req: SimulateScenarioRequest
+  ): Promise<SimulateScenarioResponse | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/scenarios/simulate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req),
-      });
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+      const response = await fetch(
+        `${this.baseUrl}/api/scenarios/simulate`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Scenario simulation failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      return (await response.json()) as SimulateScenarioResponse;
+    } catch (error) {
+      console.error('Scenario simulation request failed:', error);
       return null;
     }
   }
 
-  public async solveClassicalMIP(req: SolveRestorationRequest): Promise<ClassicalSolverResponse | null> {
+  public async solveClassicalMIP(
+    req: SolveRestorationRequest
+  ): Promise<ClassicalSolverResponse | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/restoration/solve-classical`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req),
-      });
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+      const response = await fetch(
+        `${this.baseUrl}/api/restoration/solve-classical`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Classical solver failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      return (await response.json()) as ClassicalSolverResponse;
+    } catch (error) {
+      console.error('Classical solver request failed:', error);
       return null;
     }
   }
 
-  public async getQUBO(req?: SimulateScenarioRequest): Promise<QUBOResponse | null> {
+  public async getQUBO(
+    req?: SimulateScenarioRequest
+  ): Promise<QUBOResponse | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/quantum/qubo`, {
+      const response = await fetch(`${this.baseUrl}/api/quantum/qubo`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req || {}),
       });
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+
+      if (!response.ok) {
+        throw new Error(`QUBO request failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      return (await response.json()) as QUBOResponse;
+    } catch (error) {
+      console.error('QUBO request failed:', error);
       return null;
     }
   }
 
-  public async solveQuantumQAOA(req: QAOASolveRequest): Promise<QAOASolverResponse | null> {
+  public async solveQuantumQAOA(
+    req: QAOASolveRequest
+  ): Promise<QAOASolverResponse | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/quantum/solve-qaoa`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req),
-      });
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+      const response = await fetch(
+        `${this.baseUrl}/api/quantum/solve-qaoa`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Quantum QAOA solver failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      return (await response.json()) as QAOASolverResponse;
+    } catch (error) {
+      console.error('Quantum solver request failed:', error);
       return null;
     }
   }
 
-  public async compareScenarios(req: CompareScenariosRequest): Promise<CompareScenariosResponse | null> {
+  public async compareScenarios(
+    req: CompareScenariosRequest
+  ): Promise<CompareScenariosResponse | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/compare`, {
+      const response = await fetch(`${this.baseUrl}/api/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req),
       });
-      if (res.ok) {
-        this.isConnected = true;
-        return await res.json();
+
+      if (!response.ok) {
+        throw new Error(`Scenario comparison failed: HTTP ${response.status}`);
       }
-      return null;
-    } catch {
+
+      return (await response.json()) as CompareScenariosResponse;
+    } catch (error) {
+      console.error('Scenario comparison request failed:', error);
       return null;
     }
   }
